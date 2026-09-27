@@ -834,8 +834,7 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
 
 // Parse URI and populate config fields
 // Returns 0 on success, -1 on error
-static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string &uri_authenticate,
-                     std::string &uri_server)
+static int parse_uri(const char *uri, struct benchmark_config *cfg)
 {
     if (!uri || strlen(uri) == 0) {
         fprintf(stderr, "error: empty URI provided.\n");
@@ -864,9 +863,6 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
         // Regular Redis connection
     } else if (strcmp(ptr, "rediss") == 0) {
 #ifdef USE_TLS
-        if (cfg->tls) {
-            fprintf(stderr, "warning: both URI and --tls specified, URI takes precedence.\n");
-        }
         cfg->tls = true;
 #else
         fprintf(stderr, "error: TLS not supported in this build.\n");
@@ -886,13 +882,29 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
     char *host_start = ptr;
 
     if (auth_end) {
-        if (cfg->authenticate) {
-            fprintf(stderr, "warning: both URI and --authenticate specified, URI takes precedence.\n");
-        }
-        // Own URI credentials separately from the borrowed --authenticate argument.
+        // Authentication present
         *auth_end = '\0';
-        uri_authenticate = ptr;
-        cfg->authenticate = uri_authenticate.c_str();
+        char *colon = strchr(ptr, ':');
+        if (colon) {
+            // user:password format
+            *colon = '\0';
+            char *user = ptr;
+            char *password = colon + 1;
+
+            // Combine as user:password for authenticate field
+            int auth_len = strlen(user) + strlen(password) + 2;
+            char *auth_str = (char *) malloc(auth_len);
+            if (!auth_str) {
+                fprintf(stderr, "error: memory allocation failed.\n");
+                free(uri_copy);
+                return -1;
+            }
+            snprintf(auth_str, auth_len, "%s:%s", user, password);
+            cfg->authenticate = auth_str;
+        } else {
+            // Just password (default user)
+            cfg->authenticate = strdup(ptr);
+        }
         host_start = auth_end + 1;
     }
 
@@ -908,9 +920,6 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
                 fprintf(stderr, "error: invalid database number '%s'.\n", db_start);
                 free(uri_copy);
                 return -1;
-            }
-            if (cfg->select_db) {
-                fprintf(stderr, "warning: both URI and --select-db specified, URI takes precedence.\n");
             }
             cfg->select_db = db;
         }
@@ -928,19 +937,12 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
             free(uri_copy);
             return -1;
         }
-        if (cfg->port) {
-            fprintf(stderr, "warning: both URI and --port specified, URI takes precedence.\n");
-        }
         cfg->port = (unsigned short) port;
     }
 
-    // Own URI hosts separately from a borrowed --server argument or the default.
+    // Set host
     if (strlen(host_start) > 0) {
-        if (cfg->server) {
-            fprintf(stderr, "warning: both URI and --host/--server specified, URI takes precedence.\n");
-        }
-        uri_server = host_start;
-        cfg->server = uri_server.c_str();
+        cfg->server = strdup(host_start);
     }
 
     free(uri_copy);
@@ -2736,16 +2738,14 @@ void usage()
         "                                 S for Sequential selection.\n"
         "                                 R for Random selection.\n"
         "      --scan-incremental-iteration\n"
-        "                                 Enable cursor iteration for SCAN, SSCAN, HSCAN and ZSCAN.\n"
-        "                                 Use --command=\"SCAN 0 ...\" or --command=\"HSCAN key 0 ...\", etc.\n"
-        "                                 Automatically follows the cursor returned by each response.\n"
-        "                                 Sends the supplied command initially and updates its cursor until\n"
+        "                                 Enable SCAN cursor iteration mode. When used with\n"
+        "                                 --command=\"SCAN 0 [MATCH pattern] [COUNT count] [TYPE type]\",\n"
+        "                                 automatically follows the cursor returned by each SCAN response.\n"
+        "                                 Sends \"SCAN 0 ...\" initially, then \"SCAN <cursor> ...\" until\n"
         "                                 the cursor returns 0, then restarts. Requires --pipeline 1.\n"
-        "                                 Stats separate \"<COMMAND> 0\" from \"<COMMAND> <cursor>\".\n"
-        "                                 Collection keys and generated arguments stay fixed per cursor walk.\n"
-        "                                 Requires one --command and standalone Redis (no cluster mode).\n"
+        "                                 Stats are reported separately for \"SCAN 0\" and \"SCAN <cursor>\".\n"
         "      --scan-incremental-max-iterations=NUMBER\n"
-        "                                 Maximum number of continuations per cursor walk\n"
+        "                                 Maximum number of continuation SCANs per iteration cycle\n"
         "                                 (default: 0, follow cursor until it returns 0).\n"
         "      --command-is-read          Mark the preceding --command as a read operation for\n"
         "                                 --read-preference routing (per-command override).\n"
@@ -4310,9 +4310,6 @@ int main(int argc, char *argv[])
         fprintf(stderr, "warning: core dumps may not be generated on crash\n");
     }
 
-    // Keep URI storage alive for cfg and its workers; neither string changes after parsing.
-    std::string uri_authenticate;
-    std::string uri_server;
     benchmark_config cfg = benchmark_config();
     cfg.arbitrary_commands = new arbitrary_command_list();
     cfg.monitor_commands = new monitor_command_list();
@@ -4539,7 +4536,26 @@ int main(int argc, char *argv[])
 
     // Process URI if provided
     if (cfg.uri) {
-        if (parse_uri(cfg.uri, &cfg, uri_authenticate, uri_server) < 0) {
+        // Check for conflicts with individual connection parameters
+        if (cfg.server && strcmp(cfg.server, "localhost") != 0) {
+            fprintf(stderr, "warning: both URI and --host/--server specified, URI takes precedence.\n");
+        }
+        if (cfg.port && cfg.port != 6379) {
+            fprintf(stderr, "warning: both URI and --port specified, URI takes precedence.\n");
+        }
+        if (cfg.authenticate) {
+            fprintf(stderr, "warning: both URI and --authenticate specified, URI takes precedence.\n");
+        }
+        if (cfg.select_db) {
+            fprintf(stderr, "warning: both URI and --select-db specified, URI takes precedence.\n");
+        }
+#ifdef USE_TLS
+        if (cfg.tls) {
+            fprintf(stderr, "warning: both URI and --tls specified, URI takes precedence.\n");
+        }
+#endif
+
+        if (parse_uri(cfg.uri, &cfg) < 0) {
             exit(1);
         }
 
@@ -4627,8 +4643,7 @@ int main(int argc, char *argv[])
             exit(1);
         }
         if (!cfg.arbitrary_commands->is_defined()) {
-            fprintf(stderr,
-                    "error: --scan-incremental-iteration requires --command with SCAN, SSCAN, HSCAN or ZSCAN.\n");
+            fprintf(stderr, "error: --scan-incremental-iteration requires --command with a SCAN command.\n");
             exit(1);
         }
         if (cfg.cluster_mode) {
@@ -4636,47 +4651,52 @@ int main(int argc, char *argv[])
             exit(1);
         }
 
-        // A cursor chain belongs to exactly one command and one client connection.
+        // Validate exactly one command and it must be SCAN
         size_t real_cmd_count = 0;
         for (size_t i = 0; i < cfg.arbitrary_commands->size(); i++) {
             if (!cfg.arbitrary_commands->at(i).stats_only) real_cmd_count++;
         }
         if (real_cmd_count != 1) {
-            fprintf(
-                stderr,
-                "error: --scan-incremental-iteration requires exactly one --command (SCAN, SSCAN, HSCAN or ZSCAN).\n");
+            fprintf(stderr, "error: --scan-incremental-iteration requires exactly one --command (a SCAN command).\n");
             exit(1);
         }
 
         arbitrary_command &scan_cmd = cfg.arbitrary_commands->at(0);
-        const std::string command_type = scan_cmd.command_type;
-        const bool keyspace_scan = strcasecmp(command_type.c_str(), "SCAN") == 0;
-        if (!keyspace_scan && strcasecmp(command_type.c_str(), "SSCAN") != 0 &&
-            strcasecmp(command_type.c_str(), "HSCAN") != 0 && strcasecmp(command_type.c_str(), "ZSCAN") != 0) {
-            fprintf(stderr, "error: --scan-incremental-iteration requires a SCAN, SSCAN, HSCAN or ZSCAN command.\n");
+        if (strcasecmp(scan_cmd.command_type.c_str(), "SCAN") != 0) {
+            fprintf(stderr, "error: --scan-incremental-iteration requires the command to be a SCAN command.\n");
             exit(1);
         }
-        const size_t cursor_index = keyspace_scan ? 1 : 2;
-        if (scan_cmd.command_args.size() <= cursor_index) {
-            fprintf(stderr, "error: %s command requires %s cursor argument (e.g., '%s %s0').\n", command_type.c_str(),
-                    keyspace_scan ? "a" : "a key and a", command_type.c_str(), keyspace_scan ? "" : "key ");
+        if (scan_cmd.command_args.size() < 2) {
+            fprintf(stderr, "error: SCAN command must have at least a cursor argument (e.g., 'SCAN 0').\n");
             exit(1);
         }
 
-        // Copy parsed arguments so quoting, empty strings and binary escapes survive.
-        // Only the cursor changes; generated arguments are retained by each client.
-        cfg.scan_continuation_command = new arbitrary_command(scan_cmd);
-        // The separate formatting pass below classifies this as scan_cursor_type.
-        cfg.scan_continuation_command->command_args[cursor_index].data = SCAN_CURSOR_PLACEHOLDER;
-        cfg.scan_continuation_command->command_name = command_type + " <cursor>";
-        cfg.scan_continuation_command->command_type = command_type + " <cursor>";
-        scan_cmd.command_name = command_type + " 0";
-        scan_cmd.command_type = command_type + " 0";
+        // Set display names for initial SCAN command
+        scan_cmd.command_name = "SCAN 0";
+        scan_cmd.command_type = "SCAN 0";
 
-        // Index 1 tracks continuation statistics without entering the command rotation.
-        arbitrary_command stats_cmd(command_type.c_str());
-        stats_cmd.command_name = command_type + " <cursor>";
-        stats_cmd.command_type = command_type + " <cursor>";
+        // Build continuation command string: replace cursor (arg[1]) with placeholder
+        std::string cont_cmd_str = "SCAN " SCAN_CURSOR_PLACEHOLDER;
+        for (unsigned int i = 2; i < scan_cmd.command_args.size(); i++) {
+            cont_cmd_str += " ";
+            cont_cmd_str += scan_cmd.command_args[i].data;
+        }
+
+        // Create the continuation command (stored separately, not in the list)
+        cfg.scan_continuation_command = new arbitrary_command(cont_cmd_str.c_str());
+        cfg.scan_continuation_command->command_name = "SCAN <cursor>";
+        cfg.scan_continuation_command->command_type = "SCAN <cursor>";
+        if (!cfg.scan_continuation_command->split_command_to_args()) {
+            fprintf(stderr, "error: failed to parse SCAN continuation command.\n");
+            delete cfg.scan_continuation_command;
+            cfg.scan_continuation_command = NULL;
+            return -1;
+        }
+
+        // Add a stats-only entry to arbitrary_commands for continuation stats tracking (index 1)
+        arbitrary_command stats_cmd(cont_cmd_str.c_str());
+        stats_cmd.command_name = "SCAN <cursor>";
+        stats_cmd.command_type = "SCAN <cursor>";
         stats_cmd.stats_only = true;
         cfg.arbitrary_commands->add_command(stats_cmd);
     }
@@ -5287,6 +5307,16 @@ int main(int argc, char *argv[])
 
     if (cfg.monitor_commands != NULL) {
         delete cfg.monitor_commands;
+    }
+
+    // Clean up dynamically allocated strings from URI parsing
+    if (cfg.uri) {
+        if (cfg.server) {
+            free((void *) cfg.server);
+        }
+        if (cfg.authenticate) {
+            free((void *) cfg.authenticate);
+        }
     }
 
     // Clean up StatsD client
